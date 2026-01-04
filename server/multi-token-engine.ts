@@ -15,7 +15,7 @@
 import { X402PaymentEngine, type PaymentRequest, type PaymentResult, type PaymentMetadata } from "./x402-engine";
 import { type ChainKey } from "../shared/payment-config";
 import { tokenRegistry, type TokenRegistryEntry } from "./token-registry";
-import { priceOracle, type AggregatedPrice } from "./price-oracle";
+import { oracleResolver, type ResolvedPrice } from "./oracles/oracle-resolver";
 import { tokenRiskEngine, type RiskAssessment } from "./token-risk-engine";
 import { log } from "./app";
 
@@ -203,38 +203,45 @@ export class MultiTokenPaymentEngine extends X402PaymentEngine {
       }
     }
 
-    // Get real-time price from oracle
-    let aggregatedPrice: AggregatedPrice;
+    // Get real-time price from on-chain oracles (Chainlink or Uniswap TWAP)
+    let resolvedPrice: ResolvedPrice;
 
     try {
-      aggregatedPrice = await priceOracle.getPrice(tokenSymbol, request.chainKey);
+      resolvedPrice = await oracleResolver.resolvePrice(tokenSymbol, request.chainKey);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      log(`❌ Price oracle error: ${errorMessage}`, 'multi-token-engine');
+      log(`❌ Oracle resolution error: ${errorMessage}`, 'multi-token-engine');
       return {
         success: false,
         status: 500,
         headers: {},
-        error: `Failed to get token price: ${errorMessage}`,
+        error: `Failed to resolve token price: ${errorMessage}`,
       };
     }
 
     // Check if price is safe to use
-    if (!aggregatedPrice.isSafe) {
+    if (!resolvedPrice.isSafe) {
       log(
-        `❌ Price not safe for settlement: ${aggregatedPrice.unsafeReason}`,
+        `❌ Price not safe for settlement: ${resolvedPrice.unsafeReason}`,
         'multi-token-engine'
       );
       return {
         success: false,
         status: 500,
         headers: {},
-        error: `Price oracle error: ${aggregatedPrice.unsafeReason}`,
+        error: `Price oracle error: ${resolvedPrice.unsafeReason}`,
       };
     }
 
+    // Log price resolution details
+    log(
+      `Price resolved via ${resolvedPrice.source}: $${resolvedPrice.priceUsd.toFixed(6)} (confidence: ${(resolvedPrice.confidence * 100).toFixed(1)}%)`,
+      'multi-token-engine'
+    );
+    log(`  Explanation: ${resolvedPrice.explanation.join(' → ')}`, 'multi-token-engine');
+
     // Calculate token amount required
-    const tokenAmount = priceUsd / aggregatedPrice.priceUsd;
+    const tokenAmount = priceUsd / resolvedPrice.priceUsd;
 
     // Apply slippage protection
     const slippagePercent = maxSlippagePercent || token.slippage.maxSlippagePercent;
@@ -242,7 +249,7 @@ export class MultiTokenPaymentEngine extends X402PaymentEngine {
     const tokenAmountWithSlippage = tokenAmount * slippageMultiplier;
 
     log(
-      `Token conversion: $${priceUsd} @ $${aggregatedPrice.priceUsd.toFixed(6)}/${tokenSymbol} = ${tokenAmount.toFixed(token.decimals)} ${tokenSymbol} (with ${slippagePercent}% slippage: ${tokenAmountWithSlippage.toFixed(token.decimals)})`,
+      `Token conversion: $${priceUsd} @ $${resolvedPrice.priceUsd.toFixed(6)}/${tokenSymbol} = ${tokenAmount.toFixed(token.decimals)} ${tokenSymbol} (with ${slippagePercent}% slippage: ${tokenAmountWithSlippage.toFixed(token.decimals)})`,
       'multi-token-engine'
     );
 
@@ -259,8 +266,8 @@ export class MultiTokenPaymentEngine extends X402PaymentEngine {
           ...baseResult.metadata,
           tokenSymbol,
           tokenAddress,
-          priceUsdAtExecution: aggregatedPrice.priceUsd,
-          priceConfidence: aggregatedPrice.confidence,
+          priceUsdAtExecution: resolvedPrice.priceUsd,
+          priceConfidence: resolvedPrice.confidence,
           tokenAmount: priceUsd.toFixed(token.decimals), // For stablecoins, 1:1 with USD
           riskScore: riskAssessment?.riskScore || 0,
           riskLevel: riskAssessment?.riskLevel || "LOW",
@@ -346,17 +353,24 @@ export class MultiTokenPaymentEngine extends X402PaymentEngine {
     const tokenAddress = tokenRegistry.getTokenAddress(tokenSymbol, chainKey);
     if (!tokenAddress) return null;
 
-    // Get price from oracle
+    // Get price from on-chain oracles
     const priceUsd = parseFloat(price.replace('$', ''));
-    const aggregatedPrice = await priceOracle.getPrice(tokenSymbol, chainKey);
 
-    if (!aggregatedPrice.isSafe) {
-      log(`Price not safe for quote: ${aggregatedPrice.unsafeReason}`, 'multi-token-engine');
+    let resolvedPrice: ResolvedPrice;
+    try {
+      resolvedPrice = await oracleResolver.resolvePrice(tokenSymbol, chainKey);
+    } catch (error) {
+      log(`Failed to resolve price for quote: ${error}`, 'multi-token-engine');
+      return null;
+    }
+
+    if (!resolvedPrice.isSafe) {
+      log(`Price not safe for quote: ${resolvedPrice.unsafeReason}`, 'multi-token-engine');
       return null;
     }
 
     // Calculate token amount
-    const tokenAmount = priceUsd / aggregatedPrice.priceUsd;
+    const tokenAmount = priceUsd / resolvedPrice.priceUsd;
 
     return {
       price,
@@ -368,7 +382,7 @@ export class MultiTokenPaymentEngine extends X402PaymentEngine {
       chainId: baseQuote.chainId,
       tokenAddress,
       blockExplorer: baseQuote.blockExplorer,
-      priceConfidence: aggregatedPrice.confidence,
+      priceConfidence: resolvedPrice.confidence,
       riskLevel: token.riskLevel,
       estimatedGasCostUsd: 0.5, // Placeholder - would calculate from gas price
     };
