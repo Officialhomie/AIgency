@@ -31,6 +31,15 @@
     "paths": {
       "@/*": [
         "./*"
+      ],
+      "@shared/*": [
+        "./shared/*"
+      ],
+      "@/backend/*": [
+        "./backend/*"
+      ],
+      "@/shared/*": [
+        "./shared/*"
       ]
     }
   },
